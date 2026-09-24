@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
@@ -214,28 +215,6 @@ func TestGracefulShutdown(t *testing.T) {
 }
 
 func TestApplyConfigLegacyValidation(t *testing.T) {
-	opts := &evaluatorOptions{
-		DisableAuth: true,
-		TargetURL:   &url.URL{},
-	}
-	re, err := newRuleEvaluator(
-		t.Context(), promslog.NewNopLogger(),
-		opts,
-		version.Version,
-		nil, nil, nil,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		re.Run()
-	})
-	defer func() {
-		re.Stop()
-		wg.Wait()
-	}()
-
 	dir := t.TempDir()
 	legacyRuleFile := filepath.Join(dir, "legacy.yaml")
 	if err := os.WriteFile(legacyRuleFile, []byte(`groups:
@@ -257,20 +236,44 @@ func TestApplyConfigLegacyValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := re.ApplyConfig(&promforkconfig.Config{
-		GlobalConfig: promforkconfig.DefaultGlobalConfig,
-		RuleFiles:    []string{legacyRuleFile},
-	}, opts); err != nil {
-		t.Fatalf("expected legacy rule file to succeed, got error: %v", err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		opts := &evaluatorOptions{
+			DisableAuth: true,
+			TargetURL:   &url.URL{},
+		}
+		re, err := newRuleEvaluator(
+			t.Context(), promslog.NewNopLogger(),
+			opts,
+			version.Version,
+			nil, nil, nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		defer func() {
+			wg.Go(func() {
+				re.Run()
+			})
+			re.Stop()
+			wg.Wait()
+		}()
 
-	// Trigger manager recreation via updated evaluatorOpts as well.
-	updatedOpts := *opts
-	updatedOpts.ProjectID = "test-project"
-	if err := re.ApplyConfig(&promforkconfig.Config{
-		GlobalConfig: promforkconfig.DefaultGlobalConfig,
-		RuleFiles:    []string{utf8RuleFile},
-	}, &updatedOpts); err == nil {
-		t.Fatal("expected UTF-8 recording rule metric name to fail legacy validation, got nil")
-	}
+		if err := re.ApplyConfig(&promforkconfig.Config{
+			GlobalConfig: promforkconfig.DefaultGlobalConfig,
+			RuleFiles:    []string{legacyRuleFile},
+		}, opts); err != nil {
+			t.Fatalf("expected legacy rule file to succeed, got error: %v", err)
+		}
+
+		// Trigger manager recreation via updated evaluatorOpts as well.
+		updatedOpts := *opts
+		updatedOpts.ProjectID = "test-project"
+		if err := re.ApplyConfig(&promforkconfig.Config{
+			GlobalConfig: promforkconfig.DefaultGlobalConfig,
+			RuleFiles:    []string{utf8RuleFile},
+		}, &updatedOpts); err == nil {
+			t.Fatal("expected UTF-8 recording rule metric name to fail legacy validation, got nil")
+		}
+	})
 }

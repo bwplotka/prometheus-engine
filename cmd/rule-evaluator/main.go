@@ -914,10 +914,21 @@ type ruleEvaluator struct {
 	notifierManager *notifier.Manager
 	rulesMetrics    *rules.Metrics
 
-	queryFunc         rules.QueryFunc
-	rulesManager      *rules.Manager
-	lastEvaluatorOpts *evaluatorOptions
-	mtx               sync.Mutex
+	queryFunc           rules.QueryFunc
+	rulesManager        *rules.Manager
+	rulesManagerStarted bool
+	lastEvaluatorOpts   *evaluatorOptions
+	done                chan struct{}
+	mtx                 sync.Mutex
+}
+
+// startRulesManagerLocked ensures the current rulesManager has been started.
+// rules.Manager.Stop blocks forever if rules.Manager.Run was never called.
+func (e *ruleEvaluator) startRulesManagerLocked() {
+	if !e.rulesManagerStarted {
+		e.rulesManagerStarted = true
+		go e.rulesManager.Run()
+	}
 }
 
 // Returns the URL that points to the rule-evaluator instance (set by the user). By default, or if
@@ -976,6 +987,7 @@ func newRuleEvaluator(
 		rulesManager:      rulesManager,
 		queryFunc:         queryFunc,
 		lastEvaluatorOpts: evaluatorOpts,
+		done:              make(chan struct{}),
 	}
 
 	return &evaluator, nil
@@ -1006,13 +1018,19 @@ func (e *ruleEvaluator) ApplyConfig(cfg *promforkconfig.Config, evaluatorOpts *e
 			Metrics:    e.rulesMetrics,
 		})
 
-		// Set new rule-manager and flag before stopping, so we can rerun with the new one.
 		e.mtx.Lock()
+		wasRunning := e.rulesManagerStarted
+		e.startRulesManagerLocked()
 		oldRuleManager := e.rulesManager
 		e.rulesManager = rulesManager
-		oldRuleManager.Stop()
+		e.rulesManagerStarted = wasRunning
+		if wasRunning {
+			go rulesManager.Run()
+		}
 		e.queryFunc = queryFunc
 		e.mtx.Unlock()
+
+		oldRuleManager.Stop()
 
 		_, err = queryFunc(e.ctx, "vector(1)", time.Now())
 		if err != nil {
@@ -1047,25 +1065,20 @@ func (e *ruleEvaluator) Query(ctx context.Context, q string, t time.Time) (promq
 }
 
 func (e *ruleEvaluator) Run() {
-	for {
-		// Copy the rule-manager before running, so we don't hold the lock.
-		e.mtx.Lock()
-		curr := e.rulesManager
-		e.mtx.Unlock()
-
-		// A nil indicates shutdown, otherwise it's a config update requiring restart.
-		if curr == nil {
-			break
-		}
-		curr.Run()
-	}
+	e.mtx.Lock()
+	e.startRulesManagerLocked()
+	e.mtx.Unlock()
+	<-e.done
 }
 
 func (e *ruleEvaluator) Stop() {
 	e.mtx.Lock()
-	defer e.mtx.Unlock()
-	e.rulesManager.Stop()
-	e.rulesManager = nil
+	e.startRulesManagerLocked()
+	curr := e.rulesManager
+	e.mtx.Unlock()
+
+	curr.Stop()
+	close(e.done)
 }
 
 func newQueryFunc(logger *slog.Logger, v1api v1.API) rules.QueryFunc {
